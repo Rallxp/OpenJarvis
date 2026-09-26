@@ -15,13 +15,15 @@ interface TtsStore {
   /** id of the message currently loading or speaking, if any. */
   speakingId: string | null;
   error: string | null;
+  /** Message whose read-aloud attempt failed, if any. */
+  errorId: string | null;
   /** null until the health probe has answered. */
   available: boolean | null;
   /** Last message spoken by autoplay, so a re-render never repeats it. */
   autoSpokenId: string | null;
   speak: (id: string, text: string) => Promise<void>;
   stop: () => void;
-  ensureHealth: () => void;
+  ensureHealth: () => Promise<void>;
   markAutoSpoken: (id: string) => void;
 }
 
@@ -32,6 +34,22 @@ let objectUrl: string | null = null;
 let controller: AbortController | null = null;
 let token = 0;
 let healthProbe: Promise<void> | null = null;
+
+/** Only a stream ending in the active conversation may trigger autoplay. */
+export function shouldAutoplayFinishedReply(
+  previousStreamingConversationId: string | null,
+  activeId: string | null,
+  streamIsActive: boolean,
+  lastMessage: { id: string; role: string } | undefined,
+  autoSpokenId: string | null,
+): boolean {
+  return previousStreamingConversationId !== null
+    && previousStreamingConversationId === activeId
+    && !streamIsActive
+    && lastMessage !== undefined
+    && lastMessage.role === 'assistant'
+    && lastMessage.id !== autoSpokenId;
+}
 
 function teardown(): void {
   if (audio) {
@@ -59,14 +77,22 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
   state: 'idle',
   speakingId: null,
   error: null,
+  errorId: null,
   available: null,
   autoSpokenId: null,
 
   ensureHealth: () => {
-    if (healthProbe) return;
+    if (healthProbe) return healthProbe;
     healthProbe = fetchTtsHealth()
-      .then((health) => set({ available: health.available }))
-      .catch(() => set({ available: false }));
+      .then((health) => {
+        set({ available: health.available });
+        if (!health.available) healthProbe = null;
+      })
+      .catch(() => {
+        set({ available: false });
+        healthProbe = null;
+      });
+    return healthProbe;
   },
 
   markAutoSpoken: (id: string) => set({ autoSpokenId: id }),
@@ -80,7 +106,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
     token += 1;
     const mine = token;
     teardown();
-    set({ state: 'loading', speakingId: id, error: null });
+    set({ state: 'loading', speakingId: id, error: null, errorId: null });
 
     const ac = new AbortController();
     controller = ac;
@@ -102,7 +128,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
       el.onerror = () => {
         if (mine !== token) return;
         teardown();
-        set({ state: 'idle', speakingId: null, error: 'Playback failed' });
+        set({ state: 'idle', speakingId: null, error: 'Playback failed', errorId: id });
       };
 
       await el.play();
@@ -115,6 +141,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
         state: 'idle',
         speakingId: null,
         error: err instanceof Error ? err.message : 'Speech synthesis failed',
+        errorId: id,
       });
     }
   },
@@ -122,7 +149,7 @@ export const useTtsStore = create<TtsStore>((set, get) => ({
   stop: () => {
     token += 1;
     teardown();
-    set({ state: 'idle', speakingId: null });
+    set({ state: 'idle', speakingId: null, error: null, errorId: null });
   },
 }));
 
@@ -135,6 +162,7 @@ export function __resetTtsForTests(): void {
     state: 'idle',
     speakingId: null,
     error: null,
+    errorId: null,
     available: null,
     autoSpokenId: null,
   });

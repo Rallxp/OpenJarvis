@@ -1,5 +1,8 @@
 """Tests for speech API endpoints."""
 
+import asyncio
+import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,6 +10,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient  # noqa: E402
+from httpx import ASGITransport, AsyncClient  # noqa: E402
 
 from openjarvis.speech._stubs import TranscriptionResult  # noqa: E402
 
@@ -175,6 +179,21 @@ def _tts_app(backend, *, config=None):
     return TestClient(app)
 
 
+def _unresolved_tts_app():
+    from fastapi import FastAPI
+
+    from openjarvis.server.api_routes import speech_router
+
+    app = FastAPI()
+    app.include_router(speech_router)
+    app.state.config = SimpleNamespace(
+        speech=SimpleNamespace(
+            tts_backend="kokoro", voice_id="bm_george", voice_speed=1.0
+        )
+    )
+    return app
+
+
 def test_synthesize_returns_wav(mock_tts_backend):
     client = _tts_app(mock_tts_backend)
 
@@ -238,7 +257,7 @@ def test_synthesize_surfaces_backend_failure(mock_tts_backend):
     response = client.post("/v1/speech/synthesize", json={"text": "Hallo"})
 
     assert response.status_code == 500
-    assert "voice model missing" in response.json()["detail"]
+    assert response.json()["detail"] == "Speech synthesis failed"
 
 
 def test_synthesize_offloads_backend_work(mock_tts_backend):
@@ -274,6 +293,80 @@ def test_tts_health_without_backend():
 
     assert data["available"] is False
     assert "reason" in data
+
+
+def test_tts_health_retries_after_unavailable(mock_tts_backend):
+    app = _unresolved_tts_app()
+    client = TestClient(app)
+
+    with patch(
+        "openjarvis.speech._tts_discovery.get_tts_backend",
+        side_effect=[None, mock_tts_backend],
+    ) as discover:
+        assert client.get("/v1/speech/tts/health").json()["available"] is False
+        assert client.get("/v1/speech/tts/health").json()["available"] is True
+        assert client.get("/v1/speech/tts/health").json()["available"] is True
+
+    assert discover.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tts_health_requests_share_resolution(mock_tts_backend):
+    app = _unresolved_tts_app()
+
+    def discover(_preferred):
+        time.sleep(0.05)
+        return mock_tts_backend
+
+    with patch(
+        "openjarvis.speech._tts_discovery.get_tts_backend", side_effect=discover
+    ) as mock_discover:
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            responses = await asyncio.gather(
+                *(client.get("/v1/speech/tts/health") for _ in range(3))
+            )
+
+    assert all(response.json()["available"] is True for response in responses)
+    mock_discover.assert_called_once_with("kokoro")
+
+
+@pytest.mark.asyncio
+async def test_concurrent_unavailable_probes_share_attempt_then_retry(mock_tts_backend):
+    app = _unresolved_tts_app()
+    attempts = 0
+
+    def discover(_preferred):
+        nonlocal attempts
+        attempts += 1
+        time.sleep(0.05)
+        return None if attempts == 1 else mock_tts_backend
+
+    with patch(
+        "openjarvis.speech._tts_discovery.get_tts_backend", side_effect=discover
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://testserver"
+        ) as client:
+            responses = await asyncio.gather(
+                *(client.get("/v1/speech/tts/health") for _ in range(3))
+            )
+            assert all(response.json()["available"] is False for response in responses)
+            assert attempts == 1
+            assert (await client.get("/v1/speech/tts/health")).json()["available"]
+
+    assert attempts == 2
+
+
+def test_invalid_synthesis_does_not_load_tts_backend():
+    client = TestClient(_unresolved_tts_app())
+
+    with patch("openjarvis.speech._tts_discovery.get_tts_backend") as discover:
+        response = client.post("/v1/speech/synthesize", json={"text": "  "})
+
+    assert response.status_code == 400
+    discover.assert_not_called()
 
 
 def test_voice_id_not_reused_across_backends(mock_tts_backend):

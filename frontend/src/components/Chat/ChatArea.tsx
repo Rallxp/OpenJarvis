@@ -4,7 +4,7 @@ import { MessageBubble } from './MessageBubble';
 import { InputArea } from './InputArea';
 import { StreamingDots } from './StreamingDots';
 import { useAppStore } from '../../lib/store';
-import { useTtsStore } from '../../lib/tts';
+import { shouldAutoplayFinishedReply, useTtsStore } from '../../lib/tts';
 import { stripThinkTags } from '../../lib/message-text';
 import { Sparkles, PanelRightOpen, PanelRightClose, Database, MessageSquare, X } from 'lucide-react';
 import { listConnectors } from '../../lib/connectors-api';
@@ -48,27 +48,43 @@ export function ChatArea() {
   // app or switching conversations would otherwise read stale history aloud,
   // and browsers block that anyway: playback with no preceding user gesture is
   // rejected outright, so the failure would be silent in both senses.
-  const wasStreamingRef = useRef(false);
+  const streamingConversationRef = useRef<string | null>(null);
   useEffect(() => {
-    const justFinished = wasStreamingRef.current && !isCurrentChatStreaming;
-    wasStreamingRef.current = isCurrentChatStreaming;
+    const last = messages[messages.length - 1];
+    const tts = useTtsStore.getState();
+    const justFinished = shouldAutoplayFinishedReply(
+      streamingConversationRef.current,
+      activeId,
+      streamState.isStreaming,
+      last,
+      tts.autoSpokenId,
+    );
+    streamingConversationRef.current = isCurrentChatStreaming ? activeId : null;
 
     if (!justFinished) return;
     if (!voiceOutputEnabled || !voiceAutoplay) return;
 
-    const last = messages[messages.length - 1];
-    if (!last || last.role !== 'assistant') return;
+    if (!last || last.role !== 'assistant' || activeId === null) return;
 
-    const tts = useTtsStore.getState();
-    if (tts.available !== true) return;
-    if (tts.autoSpokenId === last.id) return;
+    // Model loading may still be in flight when a fast reply completes. Wait
+    // for the probe, then confirm that this is still the active finished reply.
+    const completedConversationId = activeId;
+    const completedMessageId = last.id;
+    void tts.ensureHealth().then(() => {
+      const app = useAppStore.getState();
+      const currentTts = useTtsStore.getState();
+      const currentLast = app.messages[app.messages.length - 1];
+      if (app.activeId !== completedConversationId || app.streamState.isStreaming) return;
+      if (!app.settings.voiceOutputEnabled || !app.settings.voiceAutoplay) return;
+      if (currentLast?.id !== completedMessageId || currentTts.available !== true) return;
+      if (currentTts.autoSpokenId === completedMessageId) return;
 
-    const text = stripThinkTags(last.content);
-    if (!text) return;
-
-    tts.markAutoSpoken(last.id);
-    void tts.speak(last.id, text);
-  }, [messages, isCurrentChatStreaming, voiceOutputEnabled, voiceAutoplay]);
+      const text = stripThinkTags(currentLast.content);
+      if (!text) return;
+      currentTts.markAutoSpoken(completedMessageId);
+      void currentTts.speak(completedMessageId, text);
+    });
+  }, [activeId, messages, streamState.isStreaming, isCurrentChatStreaming, voiceOutputEnabled, voiceAutoplay]);
   const currentStreamContent = isCurrentChatStreaming ? streamState.content : '';
 
   // Check if any data sources are connected

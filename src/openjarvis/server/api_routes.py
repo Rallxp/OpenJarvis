@@ -1062,7 +1062,7 @@ async def speech_health(request: Request):
 _MAX_TTS_CHARS = 5000
 
 
-def _resolve_tts_backend(request: Request):
+async def _resolve_tts_backend(request: Request):
     """Return a healthy TTS backend, resolved once and cached on app state.
 
     Backends load models on construction, so this stays lazy: a server whose
@@ -1072,18 +1072,39 @@ def _resolve_tts_backend(request: Request):
     if getattr(app.state, "tts_resolved", False):
         return getattr(app.state, "tts_backend", None)
 
-    from openjarvis.speech._tts_discovery import get_tts_backend, voice_preferences
+    # The first health probe can load Kokoro's model. A shared task keeps that
+    # work off the event loop and coalesces concurrent probes, including when
+    # the backend is unavailable. A later request may retry that failure.
+    task = getattr(app.state, "tts_resolution_task", None)
+    if task is None:
 
-    config = getattr(app.state, "config", None)
-    if config is None:
-        from openjarvis.core.config import load_config
+        def discover():
+            from openjarvis.speech._tts_discovery import (
+                get_tts_backend,
+                voice_preferences,
+            )
 
-        config = load_config()
+            config = getattr(app.state, "config", None)
+            if config is None:
+                from openjarvis.core.config import load_config
 
-    preferred, _, _ = voice_preferences(config)
-    backend = get_tts_backend(preferred)
-    app.state.tts_backend = backend
-    app.state.tts_resolved = True
+                config = load_config()
+
+            preferred, _, _ = voice_preferences(config)
+            return get_tts_backend(preferred)
+
+        task = asyncio.create_task(asyncio.to_thread(discover))
+        app.state.tts_resolution_task = task
+
+    try:
+        backend = await asyncio.shield(task)
+    finally:
+        if task.done() and getattr(app.state, "tts_resolution_task", None) is task:
+            app.state.tts_resolution_task = None
+
+    if backend is not None:
+        app.state.tts_backend = backend
+        app.state.tts_resolved = True
     return backend
 
 
@@ -1110,12 +1131,6 @@ def _tts_voice_and_speed(request: Request, backend) -> tuple[str, float]:
 @speech_router.post("/synthesize")
 async def synthesize_speech(request: Request, body: SpeechSynthesizeRequest):
     """Synthesize text to speech and return the audio as WAV."""
-    backend = _resolve_tts_backend(request)
-    if backend is None:
-        raise HTTPException(
-            status_code=501, detail="No text-to-speech backend available"
-        )
-
     text = body.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Missing 'text'")
@@ -1123,6 +1138,12 @@ async def synthesize_speech(request: Request, body: SpeechSynthesizeRequest):
         raise HTTPException(
             status_code=413,
             detail=f"Text exceeds {_MAX_TTS_CHARS} characters",
+        )
+
+    backend = await _resolve_tts_backend(request)
+    if backend is None:
+        raise HTTPException(
+            status_code=501, detail="No text-to-speech backend available"
         )
 
     voice_id, speed = _tts_voice_and_speed(request, backend)
@@ -1141,9 +1162,7 @@ async def synthesize_speech(request: Request, body: SpeechSynthesizeRequest):
         )
     except Exception as exc:
         logger.exception("Speech synthesis failed")
-        raise HTTPException(
-            status_code=500, detail=f"Speech synthesis failed: {exc}"
-        ) from exc
+        raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
 
     return Response(
         content=result.audio,
@@ -1158,7 +1177,7 @@ async def synthesize_speech(request: Request, body: SpeechSynthesizeRequest):
 @speech_router.get("/tts/health")
 async def tts_health(request: Request):
     """Report whether voice output is available, and with which voice."""
-    backend = _resolve_tts_backend(request)
+    backend = await _resolve_tts_backend(request)
     if backend is None:
         return {"available": False, "reason": "No text-to-speech backend available"}
 

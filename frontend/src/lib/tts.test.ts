@@ -6,7 +6,7 @@ vi.mock('./api', () => ({
 }));
 
 import { synthesizeSpeech, fetchTtsHealth } from './api';
-import { useTtsStore, __resetTtsForTests } from './tts';
+import { useTtsStore, __resetTtsForTests, shouldAutoplayFinishedReply } from './tts';
 
 const synth = vi.mocked(synthesizeSpeech);
 const health = vi.mocked(fetchTtsHealth);
@@ -157,6 +157,7 @@ describe('shared voice output', () => {
     await useTtsStore.getState().speak('m1', 'Hallo');
 
     expect(useTtsStore.getState().error).toBe('No text-to-speech backend available');
+    expect(useTtsStore.getState().errorId).toBe('m1');
     expect(useTtsStore.getState().state).toBe('idle');
   });
 
@@ -174,66 +175,80 @@ describe('shared voice output', () => {
 
     expect(health).toHaveBeenCalledTimes(1);
   });
+
+  it('shares a pending health probe so autoplay can wait for model loading', async () => {
+    const pending = deferred<{ available: boolean }>();
+    health.mockReturnValue(pending.promise);
+
+    const first = useTtsStore.getState().ensureHealth();
+    const second = useTtsStore.getState().ensureHealth();
+    expect(second).toBe(first);
+    expect(health).toHaveBeenCalledTimes(1);
+
+    pending.resolve({ available: true });
+    await first;
+    expect(useTtsStore.getState().available).toBe(true);
+  });
+
+  it('retries health after an unavailable response', async () => {
+    health.mockResolvedValueOnce({ available: false });
+    health.mockResolvedValueOnce({ available: true });
+
+    await useTtsStore.getState().ensureHealth();
+    expect(useTtsStore.getState().available).toBe(false);
+    await useTtsStore.getState().ensureHealth();
+
+    expect(health).toHaveBeenCalledTimes(2);
+    expect(useTtsStore.getState().available).toBe(true);
+  });
+
+  it('retries health after a network error', async () => {
+    health.mockRejectedValueOnce(new Error('offline'));
+    health.mockResolvedValueOnce({ available: true });
+
+    await useTtsStore.getState().ensureHealth();
+    expect(useTtsStore.getState().available).toBe(false);
+    await useTtsStore.getState().ensureHealth();
+
+    expect(health).toHaveBeenCalledTimes(2);
+    expect(useTtsStore.getState().available).toBe(true);
+  });
 });
 
 describe('autoplay gating', () => {
-  // The rule ChatArea implements: speak on the falling edge of a stream, never
-  // merely because a finished reply is on screen. Encoded here so the intent
-  // survives even though the effect itself lives in the component.
-  function shouldSpeak(prev: { wasStreaming: boolean; autoSpokenId: string | null }, now: {
-    isStreaming: boolean;
-    lastRole: string;
-    lastId: string;
-  }): boolean {
-    const justFinished = prev.wasStreaming && !now.isStreaming;
-    if (!justFinished) return false;
-    if (now.lastRole !== 'assistant') return false;
-    return prev.autoSpokenId !== now.lastId;
-  }
-
   it('stays silent when a finished conversation is merely restored', () => {
-    // Page load: nothing was streaming, a completed reply is already on screen.
     expect(
-      shouldSpeak(
-        { wasStreaming: false, autoSpokenId: null },
-        { isStreaming: false, lastRole: 'assistant', lastId: 'old' },
-      ),
+      shouldAutoplayFinishedReply(null, 'chat-1', false, { role: 'assistant', id: 'old' }, null),
     ).toBe(false);
   });
 
   it('speaks when a stream finishes', () => {
     expect(
-      shouldSpeak(
-        { wasStreaming: true, autoSpokenId: null },
-        { isStreaming: false, lastRole: 'assistant', lastId: 'fresh' },
-      ),
+      shouldAutoplayFinishedReply('chat-1', 'chat-1', false, { role: 'assistant', id: 'fresh' }, null),
     ).toBe(true);
   });
 
   it('stays silent while the reply is still streaming', () => {
     expect(
-      shouldSpeak(
-        { wasStreaming: true, autoSpokenId: null },
-        { isStreaming: true, lastRole: 'assistant', lastId: 'fresh' },
-      ),
+      shouldAutoplayFinishedReply('chat-1', 'chat-1', true, { role: 'assistant', id: 'fresh' }, null),
     ).toBe(false);
   });
 
   it('never repeats a message it already spoke', () => {
     expect(
-      shouldSpeak(
-        { wasStreaming: true, autoSpokenId: 'fresh' },
-        { isStreaming: false, lastRole: 'assistant', lastId: 'fresh' },
-      ),
+      shouldAutoplayFinishedReply('chat-1', 'chat-1', false, { role: 'assistant', id: 'fresh' }, 'fresh'),
     ).toBe(false);
   });
 
   it('ignores a trailing user message', () => {
     expect(
-      shouldSpeak(
-        { wasStreaming: true, autoSpokenId: null },
-        { isStreaming: false, lastRole: 'user', lastId: 'u1' },
-      ),
+      shouldAutoplayFinishedReply('chat-1', 'chat-1', false, { role: 'user', id: 'u1' }, null),
+    ).toBe(false);
+  });
+
+  it('does not speak an old reply when the user switches conversations mid-stream', () => {
+    expect(
+      shouldAutoplayFinishedReply('chat-1', 'chat-2', true, { role: 'assistant', id: 'old' }, null),
     ).toBe(false);
   });
 });
