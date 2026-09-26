@@ -3,13 +3,30 @@
 from __future__ import annotations
 
 import io
+import sys
 import wave
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from openjarvis.core.registry import TTSRegistry
 from openjarvis.speech.piper_tts import PiperTTSBackend
+
+
+@pytest.fixture(autouse=True)
+def fake_piper_package(monkeypatch):
+    """Exercise the optional backend without installing Piper in base CI."""
+    piper = ModuleType("piper")
+    piper.__path__ = []
+    piper.PiperVoice = MagicMock()
+    piper.SynthesisConfig = lambda **kwargs: SimpleNamespace(**kwargs)
+    download_voices = ModuleType("piper.download_voices")
+    download_voices.VOICES_JSON = "https://example.invalid/voices.json"
+    download_voices.download_voice = MagicMock()
+    monkeypatch.setitem(sys.modules, "piper", piper)
+    monkeypatch.setitem(sys.modules, "piper.download_voices", download_voices)
+    return piper
 
 
 def _wav_bytes(sample_rate: int = 22050, frames: int = 2205) -> bytes:
@@ -102,6 +119,14 @@ def test_missing_package_raises_actionable_error(tmp_path):
     with patch.dict("sys.modules", {"piper": None}):
         with pytest.raises(RuntimeError, match="voice-piper"):
             backend._ensure_voice("de_DE-thorsten-medium")
+
+
+def test_synthesize_missing_package_raises_actionable_error(tmp_path):
+    backend = PiperTTSBackend(voice_dir=tmp_path)
+
+    with patch.dict("sys.modules", {"piper": None}):
+        with pytest.raises(RuntimeError, match="voice-piper"):
+            backend.synthesize("Test")
 
 
 def test_voice_cache_is_bounded(tmp_path):

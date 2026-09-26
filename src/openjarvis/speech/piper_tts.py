@@ -111,10 +111,9 @@ class PiperTTSBackend(TTSBackend):
                 f"Piper synthesizes WAV only, got output_format={output_format!r}"
             )
 
-        from piper import SynthesisConfig
-
         resolved_id = voice_id or _DEFAULT_VOICE_ID
         voice = self._ensure_voice(resolved_id)
+        from piper import SynthesisConfig
 
         # Piper scales duration, not rate: a longer utterance is a slower one,
         # so the caller's speed multiplier is its reciprocal.
